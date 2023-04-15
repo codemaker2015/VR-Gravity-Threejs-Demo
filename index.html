@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>VR Gravity Threejs Demo</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script>
+      console.clear();
+    </script>
+    <script src="https://aframe.io/releases/1.3.0/aframe.min.js"></script>
+    <script src="https://unpkg.com/aframe-orbit-controls@1.3.0/dist/aframe-orbit-controls.min.js"></script>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <script>
+      let flatscreenDemo = false;
+      const ballCount = 50;
+      const ballColors = ["#ffe710", "#00bf00", "#aac2f6", "#f13da6"];
+      const damping = 0.99;
+      const baseGravity = new THREE.Vector3(0, -0.45, 0);
+      const gravity = new THREE.Vector3();
+
+      // Room collision boundary, must be kept in sync with <a-plane> positions for walls/floor/ceiling
+      const room = { x1: -4, x2: 4, z1: -4, z2: 4, y1: 0, y2: 5 };
+
+      // Physics helpers
+      function collideRoom(point, radius) {
+        let hasCollision = false;
+        if (point.x < room.x1 + radius) {
+          point.x = room.x1 + radius;
+          hasCollision = true;
+        } else if (point.x > room.x2 - radius) {
+          point.x = room.x2 - radius;
+          hasCollision = true;
+        }
+        if (point.y < room.y1 + radius) {
+          point.y = room.y1 + radius;
+          hasCollision = true;
+        } else if (point.y > room.y2 - radius) {
+          point.y = room.y2 - radius;
+          hasCollision = true;
+        }
+        if (point.z < room.z1 + radius) {
+          point.z = room.z1 + radius;
+          hasCollision = true;
+        } else if (point.z > room.z2 - radius) {
+          point.z = room.z2 - radius;
+          hasCollision = true;
+        }
+        return hasCollision;
+      }
+
+      function constrainDistance(point, anchor, distance) {
+        return point
+          .sub(anchor)
+          .normalize()
+          .multiplyScalar(distance)
+          .add(anchor);
+      }
+
+      AFRAME.registerComponent("camera-reverse", {
+        schema: {},
+        init() {},
+        tick(time, timeDelta) {
+          if (window.vrCamera) {
+            this.el.object3D.position.x = -window.vrCamera.object3D.position.x;
+            this.el.object3D.position.y = -window.vrCamera.object3D.position.y;
+            this.el.object3D.position.z = -window.vrCamera.object3D.position.z;
+          }
+        },
+      });
+
+      // This is hacky, but the camera rig component updates the entire scene, including itself.
+      AFRAME.registerComponent("camera-rig", {
+        schema: {},
+        init() {
+          this.radius = 1.6; // collision radius, meters
+          this.originalPosition = new THREE.Vector3(0, this.radius, 0);
+          this.simPosition = this.originalPosition.clone();
+          this.prevSimPosition = this.originalPosition.clone();
+          this.inertia = new THREE.Vector3();
+          this.playerHasContact = false;
+          this.tempVec3 = new THREE.Vector3();
+          this.demoRotation = 0;
+
+          this.cameraExistingRotMat4 = new THREE.Matrix4();
+          this.cameraDeltaRotMat4 = new THREE.Matrix4();
+          this.cameraDeltaEuler = new THREE.Euler();
+        },
+        tick(time, timeDelta) {
+          // not sure if this check is needed, just here for safety
+          if (window.simReady) {
+            // When the controller trigger is squeezed, apply relative controller rotation to the camera rig.
+            if (window.isRotating) {
+              this.cameraDeltaEuler.x =
+                window.vrController.object3D.rotation.x -
+                window.controllerRotationStart.x;
+              this.cameraDeltaEuler.y =
+                window.vrController.object3D.rotation.y -
+                window.controllerRotationStart.y;
+              this.cameraDeltaEuler.z =
+                window.vrController.object3D.rotation.z -
+                window.controllerRotationStart.z;
+              this.cameraExistingRotMat4.makeRotationFromEuler(
+                window.rotationStart
+              );
+              this.cameraDeltaRotMat4.makeRotationFromEuler(
+                this.cameraDeltaEuler
+              );
+              this.cameraExistingRotMat4.multiply(this.cameraDeltaRotMat4);
+              this.el.object3D.rotation.setFromRotationMatrix(
+                this.cameraExistingRotMat4
+              );
+            }
+            // handle demo mode, and automatically reset orientation when disabled by entering VR mode
+            if (flatscreenDemo) {
+              this.demoRotation += 0.001 * timeDelta;
+              this.el.object3D.rotation.z = this.demoRotation;
+            } else if (this.demoRotation > 0) {
+              this.demoRotation = 0;
+              this.el.object3D.rotation.z = 0;
+            }
+
+            // update gravity to point down relative to the camera rig
+            gravity.copy(baseGravity).multiplyScalar(timeDelta * 0.001);
+            gravity.applyEuler(this.el.object3D.rotation);
+
+            // Simulate player body
+            this.inertia.subVectors(this.simPosition, this.prevSimPosition);
+            // apply friction with floor, walls, etc.
+            if (this.playerHasContact) {
+              this.inertia.multiplyScalar(0.8);
+            }
+            this.prevSimPosition.copy(this.simPosition);
+            this.simPosition.add(this.inertia).add(gravity);
+            this.playerHasContact = collideRoom(this.simPosition, this.radius);
+            this.el.object3D.position
+              .copy(this.simPosition)
+              .add(window.vrCamera.object3D.position)
+              .sub(this.originalPosition);
+
+            // Simulate ball collisions using Verlet integration.
+            // This is a simple model, but it works fine for this demo.
+            const physicsSteps = 10;
+            const balls = window.balls;
+            const ballDiameter = window.balls[0].radius * 2;
+
+            // apply inertia and gravity to balls each frame
+            for (const ball of balls) {
+              // `inertia` is a reference to `ball.temp1`.
+              const inertia = ball.temp1.subVectors(
+                ball.position,
+                ball.prevPosition
+              );
+              ball.prevPosition.copy(ball.position);
+              inertia.multiplyScalar(damping);
+              ball.position.add(inertia).add(gravity);
+            }
+
+            // iterative collision solver
+            for (let i = 0; i < physicsSteps; i++) {
+              for (const ball of balls) {
+                // room is a hard boundary
+                collideRoom(ball.position, ball.radius);
+
+                let hitCount = 0;
+                for (const targetBall of balls) {
+                  if (ball === targetBall) continue;
+                  // `toPoint` is a reference to `ball.temp1`.
+                  const toPoint = ball.temp1
+                    .copy(ball.position)
+                    .sub(targetBall.position);
+                  if (toPoint.length() < ballDiameter) {
+                    hitCount++;
+                    const midpoint = toPoint
+                      .multiplyScalar(0.5)
+                      .add(targetBall.position);
+                    const tempPosition = ball.temp2.copy(ball.position);
+                    // accumulate collision related movement in `ball.delta` without applying it immediately
+                    ball.delta.add(
+                      constrainDistance(
+                        tempPosition,
+                        midpoint,
+                        ball.radius
+                      ).sub(ball.position)
+                    );
+                  }
+                }
+                // flag collision and average movement delta from all sources
+                if (hitCount > 0) {
+                  ball.hasHits = true;
+                  ball.delta.divideScalar(hitCount);
+                }
+              }
+              // apply the accumulated collision related movement to balls, and reset for next frame
+              for (const ball of balls) {
+                if (!ball.hasHits) continue;
+                ball.hasHits = false;
+                ball.position.add(ball.delta);
+                ball.delta.x = 0;
+                ball.delta.y = 0;
+                ball.delta.z = 0;
+              }
+            }
+          }
+        },
+      });
+    </script>
+
+    <a-scene>
+      <a-assets>
+        <img id="floor-tex" crossorigin="anonymous" src="https://github.com/codemaker2015/VR-Gravity-Threejs-Demo/blob/master/assets/wood_basecolor.jpg" />
+        <img id="wall-tex" crossorigin="anonymous" src="https://github.com/codemaker2015/VR-Gravity-Threejs-Demo/blob/master/assets/artdeco_basecolor.jpg" />
+        <img id="ceiling-normal-tex" crossorigin="anonymous" src="https://github.com/codemaker2015/VR-Gravity-Threejs-Demo/blob/master/assets/ceiling_normal.jpg" />
+      </a-assets>
+
+      <a-sky color="#222"></a-sky>
+      <a-entity id="camera-rig" camera-rig>
+        <a-entity camera-reverse>
+          <a-entity
+            id="camera"
+            camera
+            orbit-controls="target: 0 2 0; initialPosition: 0 2.2 4; minDistance: 2;"
+          ></a-entity>
+        </a-entity>
+      </a-entity>
+      <a-entity
+        light="type: point; color: #FFE; intensity: 0.8; castShadow: true; shadowCameraFar: 10; shadowMapWidth: 1024; shadowMapHeight: 1024; shadowBias: -0.0001;"
+        position="0 3.5 0"
+      ></a-entity>
+      <a-entity
+        light="type: hemisphere; color: #FFF; groundColor: #7B6250; intensity: 0.15"
+      ></a-entity>
+
+      <a-plane
+        position="0 0 0"
+        width="8"
+        height="8"
+        rotation="-90 0 0"
+        material="src: #floor-tex; repeat: 4 4"
+        shadow="receive: true"
+      ></a-plane>
+      <a-plane
+        position="0 5 0"
+        width="8"
+        height="8"
+        rotation="90 0 0"
+        material="normalMap: #ceiling-normal-tex; normalTextureRepeat: 2.5 2.5"
+        shadow="receive: true"
+      ></a-plane>
+      <a-plane
+        position="0 2.5 -4"
+        width="8"
+        height="5"
+        rotation="0 0 0"
+        material="src: #wall-tex; repeat: 4 2.5"
+        shadow="receive: true"
+      ></a-plane>
+      <a-plane
+        position="0 2.5 4"
+        width="8"
+        height="5"
+        rotation="0 180 0"
+        material="src: #wall-tex; repeat: 4 2.5"
+        shadow="receive: true"
+      ></a-plane>
+      <a-plane
+        position="-4 2.5 0"
+        width="8"
+        height="5"
+        rotation="0 90 0"
+        material="src: #wall-tex; repeat: 4 2.5"
+        shadow="receive: true"
+      ></a-plane>
+      <a-plane
+        position="4 2.5 0"
+        width="8"
+        height="5"
+        rotation="0 -90 0"
+        material="src: #wall-tex; repeat: 4 2.5"
+        shadow="receive: true"
+      ></a-plane>
+
+      <a-entity
+        id="controller"
+        vive-controls="hand: right; model: false"
+        oculus-touch-controls="hand: right; model: false"
+      ></a-entity>
+    </a-scene>
+
+    <script>
+      const scene = document.querySelector("a-scene");
+      window.vrCamera = document.getElementById("camera");
+      window.vrCameraRig = document.getElementById("camera-rig");
+      window.vrController = document.getElementById("controller");
+
+      window.isRotating = false;
+      window.rotationStart = new THREE.Euler();
+      window.controllerRotationStart = new THREE.Euler();
+      window.vrController.addEventListener("triggerdown", () => {
+        window.isRotating = true;
+        window.rotationStart.copy(window.vrCameraRig.object3D.rotation);
+        window.controllerRotationStart.copy(
+          window.vrController.object3D.rotation
+        );
+      });
+      window.vrController.addEventListener("triggerup", () => {
+        window.isRotating = false;
+      });
+
+      window.balls = [];
+      for (let i = 0; i < ballCount; i++) {
+        const color = ballColors[i % ballColors.length];
+        const el = document.createElement("a-icosahedron");
+        const radius = 0.1;
+        // const radius = 0.25;
+        el.setAttribute("color", color);
+        el.setAttribute("radius", String(radius));
+        el.setAttribute("detail", "2");
+        el.setAttribute("roughness", "0.38");
+        el.setAttribute("shadow", "cast: true; receive: true;");
+        scene.appendChild(el);
+        el.object3D.position.y = radius;
+        el.object3D.position.x = Math.random() * 6 - 3;
+        el.object3D.position.z = Math.random() * 6 - 3;
+        window.balls.push({
+          radius: radius,
+          hasHits: false,
+          delta: new THREE.Vector3(),
+          temp1: new THREE.Vector3(),
+          temp2: new THREE.Vector3(),
+          position: el.object3D.position,
+          prevPosition: el.object3D.position.clone(),
+        });
+      }
+
+      scene.addEventListener("enter-vr", () => {
+        flatscreenDemo = false;
+      });
+
+      window.simReady = true;
+    </script>
+
+    <div class="tip">
+      Change the direction of gravity by rotating your right controller while
+      holding the trigger.
+    </div>
+  </body>
+</html>
